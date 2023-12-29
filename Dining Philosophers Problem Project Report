@@ -1,0 +1,993 @@
+Centralized algorithm:
+Design:
+	The coordinator is the parent process, and whenever a process wants to access the utensils (token/shared resources), they must ask the coordinator for permission. The simplest case is when no processes are currently accessing the requested resources and the coordinator sends a grant (token) back to the requesting process so that it can proceed. When this process is finished with its eating time, it sends a release resources message to the coordinator so the resources can be updated and used for other processes.
+If, however, a process asks for permission and another process is currently accessing the requested resources, the coordinator cannot and will not grant permission in order to avoid deadlock. Our coordinator sends a reply saying that the given process “must wait.” The coordinator queues the requesting process and waits for other requests that can be granted.
+When the process that the longest queued process was waiting for has released its exclusive access to the coordinator, the coordinator takes this first process off the queue and sends it a grant message to access the shared materials. Since each denied request is queued, there is no starvation. 
+
+Implementation:
+	Our socket-based implementation of the centralized algorithm uses parent-child and server-client relationships between the coordinator and philosophers. The coordinator is the parent and server, and the philosophers are the children and clients. 
+The parent code includes a fork() system call and an execl() system call that passes the id, command line argument, and time zero for the parent (for consistency across children). The coordinator also uses system calls socket(), bind(), listen(), accept(), select(), send(), and recv(), where the listen() call listens for 5 philosophers and the select() call uses recv() to get request messages from each philosopher. And, of course, the coordinator checks the process id and will only grant access to the resources if both the left and the right utensil/chopsticks are available for the requesting process.
+The child code uses system calls socket(), connect(), send(), and recv() to connect to the coordinator. Each philosopher randomizes its eating and thinking time during each loop.
+	The token that is passed is a structure where the fields are ID, leftToken, and rightToken. 
+ 
+Token-ring algorithm:
+Design:
+	This algorithm is a logical ring where each philosopher has a set position in the ring represented by process id from 1-5. Each process only needs to know where the next process is located to be able to send its messages to the next socket; each process also needs to accept the connection from the previous process so that messages can be sent to and received by connected processes.
+	During initialization, process 0 (has process id 1 in our implementation) is given the token by default and it begins to circulate around the ring, wrapping around from process 5 to process 1 (Pk+1 mod 5 where k = process id). 
+	If a process receives the token from its neighbor and does not need any shared resources (utensils to eat), it passes the token. If the process does need to access the shared resources, having the token is its permission to access. Only once the process is finished using the resources will it pass the token along in the ring.
+
+Implementation:
+	Our socket-based implementation of the token-ring algorithm uses a peer-peer relationship where each philosopher is both a client and a server. To start each philosopher, a fork() and an execl() with id and command line parameters is used. Because each process is both a client and a server, calls to socket()*2, bind(), listen(), connect(), accept(), fork(), waitpid(), send(), and recv() are used within each philosopher client/server.
+	The token sent to each process uses a packToken() function with token and process id parameters: the fields are ID, leftToken, and rightToken, and it’s sent via a character array (buffer) to the next process in the ring. 
+
+Summary (which easiest to create and why):
+	The centralized algorithm was the easiest to create because communication took place through multiple sockets but only one port, which simplified things quite a bit. It was also the most similar to previous projects we completed already in this course. The memory is also a bit easier to manage with the centralized algorithm since most of it can be stored and managed by the coordinator. However, each process in the token-ring algorithm needs to check and maintain its own virtual memory as well as the shared memory.
+ 
+Listing of programs:
+Centralized algorithm:
+centralCoord.c
+/* Coordinator */
+/* Coordinator will keep track of available resources
+	and gives permission to the philosopher has enough resources to eat.
+*/
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <time.h>
+#include "soc.h"
+#include "philosopher.h"
+
+void enqueue(int *array, int input);
+void dequeue(int *array, int location);
+void printq(int array[]);
+void printt(int array[]);
+
+int main (int argc, char *argv[]) {
+	time_t t = time(0);
+	
+	/* initiate variables */
+	int err, pid;				// for child process calling
+	int i;						// counter
+	int cSocket[N];				// client socket
+	int sSocket;				// server socket
+	struct sockaddr_in sAddr;	// server socket addr
+	struct sockaddr_in cAddr[N];// client socket addr
+	int cSocLen;				// client socket length
+	char msg[BUFFLEN];			// buffer
+	int status;					// child process exit status
+	int nfd;
+	fd_set RFD;
+	struct timeval waitTime;	// wait time
+	int ADDPORT = atoi(argv[1]);
+	char TIME0[30];
+	sprintf(TIME0, "%d", t);
+	int t0 = atoi(TIME0);
+	
+	/* set up coordinator socket */
+	sSocket = socket(AF_INET, SOCK_STREAM, 0); // AF_INET
+	if (sSocket == -1) {
+		perror("socServer: socket creation failed");
+		exit(1);
+	}
+	setAddr(&sAddr, 0, ADDPORT);
+	err = bind(sSocket, (struct sockaddr*)&sAddr,
+				sizeof(struct sockaddr_in));
+	if (err == -1) {
+		perror("socServer: bind address to socket failed");
+		exit(2);
+	}
+	err = listen(sSocket, 5);
+	if (err == -1) {
+		perror("socServer: listen failed");
+		exit(3);
+	}	
+	printf("Coordinator setup successfully...\n");
+	printf("About to run %d processes...\n\n", N);
+	
+	// Execl 5 philosophers
+	for (i = 0; i < N; i++) {
+		char id[1];
+		id[0] = i + '1';
+		
+		pid = fork();
+		if (pid < 0) {	/* fork failed */
+			perror("Starter: Fork failed");
+			exit(5);
+		}
+		else if (pid == 0) {	/* in child process */
+			execl("./philosopher", "philosopher", id, argv[1], TIME0);
+		}
+		cSocket[i] = accept(sSocket, (struct sockaddr*)&cAddr[i], &cSocLen);
+		printf("P[%c] connected.\n", id[0]);
+	}
+	
+	// CENTRALIZED ALGORITHM
+	// START SIMULATING //
+	printf("\nCENTRALIZED ALGORITHM\n");
+	int chopsticks[6] = {-1, 1, 2, 3, 4, 5};
+	int queue[5] = {0, 0, 0, 0, 0};
+
+	while(1) {
+		int isReceived = 0;
+		for (i = 0; i < N; i++) {
+			FD_ZERO (&RFD);
+			FD_SET (cSocket[i], &RFD);
+			nfd = cSocket[i] + 1;
+			waitTime.tv_sec = 0;// select return immediately (no wait).
+			waitTime.tv_usec = 10;
+			err = select (nfd, &RFD, NULL, NULL, &waitTime);
+			if (err > 0) {
+				err = recv(cSocket[i], msg, 8, 0);
+				isReceived = 1;
+				break;
+			}
+		}
+		
+		double ts;
+		if (isReceived == 1) {
+			int thisID = msg[1] - '0';
+			int left = msg[2]-'0';
+			int right = msg[3]-'0';
+			if (msg[0] == 'q') {
+				printf("TS%.0f. Coord: P[%d] wait to eat\n",
+						difftime(time(NULL), t0), thisID);
+				enqueue(queue, thisID);
+				printq(queue);
+				for (i = 0; i < N; i++) {
+					if (queue[i] == 0) break;
+					int id = queue[i];
+					int leftToken = id;
+					int rightToken = (id>1)?(id-1):5;
+					if (chopsticks[leftToken] != 0 &&
+						chopsticks[rightToken] != 0) {
+						printt(chopsticks);
+						chopsticks[leftToken] = 0;
+						chopsticks[rightToken] = 0;
+						printf("TS%.0f. Coord: P[%d] has permission to eat now\n",
+								difftime(time(NULL), t0), id);
+						dequeue(queue, i);
+						printq(queue);
+						sprintf(msg, "%d", 1);
+						send(cSocket[id-1], msg, 8, 0);
+					}
+				}
+//				}
+			}
+			if (msg[0] == 'r') {
+				chopsticks[left] = left;
+				chopsticks[right] = right;
+				for (i = 0; i < N; i++) {
+					if (queue[i] == 0) break;
+					int id = queue[i];
+					int leftToken = id;
+					int rightToken = (id>1)?(id-1):5;
+					if (chopsticks[leftToken] != 0 &&
+						chopsticks[rightToken] != 0) {
+						printt(chopsticks);
+						chopsticks[leftToken] = 0;
+						chopsticks[rightToken] = 0;
+						printf("TS%.0f. Coord: P[%d] has permission to eat now\n",
+								difftime(time(NULL), t0), id);
+						dequeue(queue, i);
+						printq(queue);
+						sprintf(msg, "%d", 1);
+						send(cSocket[id-1], msg, 8, 0);
+					}
+				}
+			}			
+		}
+	}
+}
+
+void enqueue(int *array, int input) {
+	int i;
+	for (i = 0; i < N; i++) {
+		if (*(array + i) == 0) {
+			*(array + i) = input;
+			break;
+		}
+	}
+}
+
+void dequeue(int *array, int location) {
+	int i;
+	for (i = location; i < N - 1; i++) {
+		*(array+i) = *(array+i+1);
+	}
+	*(array+N-1) = 0;
+}
+
+void printq(int array[]) {
+	int i;
+	printf("Queue: ");
+	for (i = 0; i < N; i++) {
+		printf("%d ", array[i]);
+	}
+	printf("\n");
+}
+
+void printt(int array[]) {
+	int i;
+	printf("Available chopsticks: ");
+	for (i = 1; i < N + 1; i++) {
+		printf("%d ", array[i]);
+	}
+	printf("\n");
+}
+
+
+
+ 
+philosopher.c
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+#include "soc.h"
+#include "philosopher.h"
+
+// main program
+int main (int argc, char *argv[]) {
+	/* initiate necessary variables */
+	int err;					// err indicators
+	int cSocket;				// philosopher socket
+	struct sockaddr_in sAddr;	// server address
+	struct sockaddr_in cAddr;	// client address
+	int cSocLen;				// client socket length
+	char msg[BUFFLEN];			// message
+	int thisID = atoi(argv[1]);
+	int ADDPORT = atoi(argv[2]);
+	int t0 = atoi(argv[3]);
+	
+	/* set up philosopher's socket */
+	setAddr(&cAddr, 0, ADDPORT);
+	cSocket = socket ( AF_INET, SOCK_STREAM, 0); // AF_INET
+	if (cSocket == -1) {
+		perror ("Philosopher: socket creation failed");
+		exit (1);
+	}
+	// connect to coordinator
+	err = connect (cSocket, (struct sockaddr *)&cAddr,
+			sizeof(struct sockaddr_in));
+	if (err == -1) {
+		perror ("Philosopher: connect failed");
+		exit (2);
+	}
+	sleep(1); // waot for all connect
+	
+	// initialize philosopher
+	int leftToken = thisID;
+	int rightToken = (thisID>1)?(thisID-1):5;
+	Philosopher p = {thisID, leftToken, rightToken, 0, 0};
+
+	// simulating
+	for (;;) {
+		err = -1;
+		if (p.isEat == 0 && p.isThink == 0) {
+			printf("TS%.0f. P[%d] wants to eat now\n", 
+					difftime(time(NULL), t0), thisID);
+			sprintf(msg, "q%d%d%d", thisID, leftToken, rightToken);
+			err = send(cSocket, msg, 8, 0);
+		}
+		
+		do {
+			err = recv(cSocket, msg, 8, 0);
+		} while (err == -1 && errno == EINTR && msg[1] == 'o');
+		
+		// Eat
+		printf("TS%.0f. P[%d] picks up chopsticks %d and %d to eat\n",
+				difftime(time(NULL), t0), thisID, (leftToken==0)?5:leftToken, (rightToken==0)?5:rightToken);
+		p.isEat = 1;
+		srand(time(NULL)+thisID);
+		int t = rand()%3 + 2;
+		printf("TS%.0f. P[%d] will eat for %d seconds\n", 
+				difftime(time(NULL), t0), thisID, t);
+		sleep(t);
+		// Done eat
+		printf("TS%.0f. P[%d] is done eating and is releasing utensils %d and %d\n", 
+				difftime(time(NULL), t0), thisID, leftToken, rightToken);
+		p.isEat=0;
+		sprintf(msg, "r%d%d%d", thisID, leftToken, rightToken);
+		err = send(cSocket, msg, 8, 0);
+		
+		// Think
+		p.isThink = 1;
+		srand(time(NULL)+thisID);
+		t = rand()%3 + 2;
+		printf("TS%.0f. P[%d] will think for %d seconds\n",
+				difftime(time(NULL), t0), thisID, t);
+		sleep(t);
+		// Done think
+		p.isThink = 0;
+	}
+}
+
+ 
+Token-ring algorithm:
+tokenRingStarter.c
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+#include "soc.h"
+#include "philosopher.h"
+
+int main (int argc, char *argv[]) {
+	int i;
+	int pid;
+
+	printf("\nAbout to run %d processes...\n", N);
+		
+	for (i = 1; i < N + 1; i++) {
+		char id[1];
+		id[0] = i + '0';
+		
+		pid = fork();
+		if (pid < 0) {	/* fork failed */
+			perror("Starter: Fork failed");
+			exit(5);
+		}
+		else if (pid == 0) {	/* in child process */
+			execl("./tokenRingAlgoirthm", "tokenRingAlgoirthm", id, argv[1]);
+		}
+	}
+	
+	for(;;){
+	}
+}
+
+
+
+ 
+tokenRingAlgoirthm.c
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/select.h>
+#include <time.h>
+#include "soc.h"
+#include "philosopher.h"
+
+void printAvailable (int c[], int ID);
+int packToken (int c[], int thisID);
+
+int main (int argc, char *argv[]) {
+	/* init */
+	int err;									// Errors handler
+	int i;										// Counter
+	int thisSocket;								// This philosopher's socket
+	int nextSocket;								// Next philosopher's socket
+	int prevSocket;								// Previous philosopher's socket
+	struct sockaddr_in thisAddr;				// This philosopher's address
+	struct sockaddr_in nextAddr;				// Next philosopher's address
+	struct sockaddr_in prevAddr;				// Previous philosopher's address
+	int socLen = sizeof(struct sockaddr_in);	// Socket length
+	char err_msg[BUFFLEN];						// Error message
+	char send_msg[BUFFLEN];						// Sending message
+	char recv_msg[BUFFLEN];						// Receiving message
+	int thisID = atoi(argv[1]);					// Philosopher's ID
+	int nextID = ((thisID+1)<N+1)?(thisID+1):1;	// Next philosopher's ID
+	int prevID = ((thisID-1)>0)?(thisID-1):N;	// Previous philosopher's ID
+	int ADDPORT = atoi(argv[2]);
+	int status;									// Child status
+	time_t t0 = time(0);						// Start time
+	int nfd;
+	fd_set RFD;
+	struct timeval waitTime;	// wait time
+
+	/* Set up this philosopher socket */
+	thisSocket = socket(AF_INET, SOCK_STREAM, 0); // AF_INET
+	if (thisSocket == -1) {
+		sprintf(err_msg, "P[%d]: socket creation failed", thisID);
+		perror (err_msg);
+		exit(1);
+	}
+	setAddr(&thisAddr, thisID, ADDPORT);
+	err = bind(thisSocket, (struct sockaddr*)&thisAddr,
+				sizeof(struct sockaddr_in));
+	if (err == -1) {
+		sprintf(err_msg, "P[%d]: bind address to socket failed", thisID);
+		perror (err_msg);
+		exit(1);
+	}
+	err = listen(thisSocket, 5);
+	if (err == -1) {
+		sprintf(err_msg, "P[%d]: listen failed", thisID);
+		perror (err_msg);
+		exit(1);
+	}
+	printf("ID[%d]: Port %d is ready\n", thisID, ntohs(thisAddr.sin_port));
+	sleep(1);	// wait for everybody to be ready
+	
+	/* Connect to the next philosopher socket */
+	setAddr(&nextAddr, nextID, ADDPORT);
+	nextSocket = socket (AF_INET, SOCK_STREAM, 0); // AF_INET
+	if (nextSocket == -1) {
+		sprintf(err_msg, "P[%d]: socket creation for P[%d] failed", thisID, nextID);
+		perror (err_msg);
+		exit (2);
+	}
+	err = connect (nextSocket, (struct sockaddr *)&nextAddr,
+					sizeof(struct sockaddr_in));
+	printf("ID[%d]: Connects port %d\n", thisID, ntohs(nextAddr.sin_port));
+
+	/* Accept the previous philosopher's connection */
+	prevSocket = accept(thisSocket, (struct sockaddr*)&prevAddr,
+						&socLen);
+	sleep(1);	// wait for everybody to be ready
+	
+	/* At this point, the ring is created */
+	///// PHILOSOPHER TOKEN RING //////
+	/* INIT */
+	int leftToken = thisID;
+	int rightToken = (thisID>1)?(thisID-1):5;
+	Philosopher p = {thisID, leftToken, rightToken, 0, 0};
+	int haveToken = (thisID==1)?1:0;
+	int tokens[N + 1];
+	for (i = 1; i < N + 1; i++) {
+		tokens[i] = i;
+	}
+	
+	if (haveToken == 1) {
+		printAvailable(tokens, thisID);
+		printf("\nTOKEN RING ALGORITHM\n");
+	}	
+	int isRecv = 0;
+	// START SIMULATING
+	for(;;) {
+		if (haveToken == 1) {
+			// If the philosopher holds a token
+			// Update tokens' status
+			if (isRecv > 0) {
+				for (i = 1; i < N + 1; i++) {
+					tokens[i] = recv_msg[i] - '0';
+				}
+			}
+			
+			if (p.isEat == 0 &&
+				p.isThink == 0 &&
+				tokens[p.leftToken] == p.leftToken &&
+				tokens[p.rightToken] == p.rightToken) {
+				// And this philosopher can eat
+				// Start eating, picking up forks
+				printf("TS%.0f. P[%d]: Has the token and is ready to eat.\n", 
+						difftime(time(0), t0), thisID);	
+				p.isEat = 1;
+				tokens[p.leftToken] = 0;
+				tokens[p.rightToken] = 0;
+				printf("P[%d]: Picking up utensils %d and %d to eat\n", 
+						thisID, p.leftToken, p.rightToken);
+				printAvailable(tokens, thisID);
+				
+				// Eating
+				err = fork();
+				if (err == -1) {
+					sprintf(err_msg, "P[%d]: fork failed", thisID);
+					perror (err_msg);
+					exit (2);
+				}
+				else if (err == 0) {
+					// Child process
+					srand(time(NULL)+thisID);
+					int r = rand()%3 + 2;
+					printf("TS%.0f. P[%d] will eat for %d seconds.\n", 
+							difftime(time(0), t0), thisID, r);
+					sleep(r);
+					exit(0);
+				}
+			}
+			
+			else if (p.isThink == 1) {
+				// Check done thinking
+	     		err = waitpid(-1, &status, WNOHANG);
+	    		if (err > 0) { // Done thinking
+	    			printf("TS%.0f. P[%d] has finished thinking.\n", 
+							difftime(time(0), t0), thisID);
+					p.isThink = 0;
+				}
+			}
+			
+			else if (p.isEat == 1) { // If the philosopher is eating
+	    		// Check done eating
+		     	err = waitpid(-1, &status, WNOHANG);
+		    	if (err > 0) { // Done eating
+	    			printf("TS%.0f. P[%d] has finished eating.\n", 
+							difftime(time(0), t0), thisID);
+		    		// Release tokens
+					printf("P[%d]: Releasing chopsticks %d and %d\n",
+							thisID, p.leftToken, p.rightToken);
+					tokens[p.leftToken] = p.leftToken;
+					tokens[p.rightToken] = p.rightToken;
+					printAvailable(tokens, thisID);
+					p.isEat = 0;
+					p.isThink = 1;			
+					err = fork();			
+					if (err == -1) {
+						sprintf(err_msg, "P[%d]: fork failed", thisID);
+						perror (err_msg);
+						exit (2);
+					}
+					else if (err == 0) {
+						// Child process
+						srand(time(NULL)+thisID);
+						int r = rand()%3 + 2;
+						printf("TS%.0f. P[%d] will think for %d seconds.\n",
+								difftime(time(0), t0), thisID, r);
+						sleep(r);
+						exit(0);
+					}
+				}
+			}
+			
+			// Send token to next process
+			int packedToken = packToken (tokens, thisID);
+			sprintf(send_msg, "%d", packedToken);
+			err = send(nextSocket, send_msg, 8, 0);
+			haveToken = 0;
+		}
+		
+		/* Select receive wait */
+		FD_ZERO (&RFD);
+		FD_SET (prevSocket, &RFD);
+		nfd = prevSocket + 1;
+		waitTime.tv_sec = 0;	// select return immediately (no wait).
+		waitTime.tv_usec = 10;
+		err = select (nfd, &RFD, NULL, NULL, &waitTime);
+		if (err > 0) { // If recv_msg came
+			isRecv = recv(prevSocket, recv_msg, 8, 0);
+			haveToken = 1;
+		}
+	}
+}
+
+
+void printAvailable (int c[], int ID) {
+	int i;
+	printf("P[%d]: Available chopsticks: ", ID);
+	for (i = 1; i < N + 1; i++) {
+		printf("%d ", c[i]);
+	}
+	printf("\n");
+}
+
+int packToken (int c[], int thisID) {
+	int i;
+	int result = thisID;
+	for (i = 1; i < N + 1; i++) {
+		result = result * 10 + c[i];
+	}
+	return result;
+}
+Shared files:
+philosopher.h 
+#ifndef PHILOSOPHER_H
+#define PHILOSOPHER_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#define N 5
+
+typedef struct Philosopher {
+	int ID;
+	int leftToken;
+	int rightToken;
+	int isEat;
+	int isThink;
+} Philosopher;
+
+#endif
+
+soc.h 
+#ifndef SOC_H
+#define SOC_H
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <string.h>
+
+#define SERVERPORT 		31200
+#define SERVERIP		"199.17.28.80"
+#define SERVERNAME		"csci4"
+#define BUFFLEN 50
+
+typedef struct sockaddr_in sockaddr_in;
+
+void setAddr(sockaddr_in *thisAddr, int thisID, int ADDPORT) {
+	memset (&(*thisAddr), 0, sizeof(struct sockaddr_in));
+	(*thisAddr).sin_family = AF_INET;
+	(*thisAddr).sin_port = htons(SERVERPORT + thisID + ADDPORT);
+	(*thisAddr).sin_addr.s_addr = inet_addr(SERVERIP);
+}
+
+#endif
+Makefile
+all: clean centralCoord philosopher tokenRingAlgoirthm starter
+
+centralCoord: soc.h philosopher.h centralCoord.c
+	$(CC) -o startC philosopher.h soc.h centralCoord.c
+
+philosopher: soc.h philosopher.h philosopher.c
+	$(CC) -o philosopher philosopher.h soc.h philosopher.c
+
+tokenNode: soc.h philosopher.h tokenRingAlgoirthm.c
+	$(CC) -o tokenRingAlgoirthm philosopher.h soc.h tokenRingAlgoirthm.c
+
+starter: soc.h philosopher.h tokenRingStarter.c
+	$(CC) -o startTR philosopher.h soc.h tokenRingStarter.c
+
+clean:
+	rm -f startC
+	rm -f startTR
+	rm -f philosopher
+	rm -f tokenRingAlgoirthm
+
+
+ 
+Man page documentation:
+-	NAME
+-	           	make – make utility to maintain the specific programs in our project
+-	           	./startTR – start the Token Ring program
+-	           	./startC – start the Centralized Algorithm program
+-	SYNOPSIS
+-	           make [command]
+-	           ./startTR [integer]
+-	           ./startC [integer]
+-	DESCRIPTION
+-	To see the purpose of the make utility see the man page using simple command:
+-	     man make
+-	The token ring algorithm is used to simulate the dining philosophers problem. To start the token ring program enter the command:
+-	     ./startTR [PortNumber]
+-	The centralized coordinator algorithm is used to simulate the dining philosophers problem with a central algorithm. To start the centralized program enter the command:
+-	    ./startC [PortNumber]
+-	Both will start the simulation of the dining philosophers problem. The program will cycle endlessly until manually stopped using ctrl+c.
+-	Only run one program at a time otherwise output will be jumbled.
+-	[PortNumber] is the desired port number. It can be any arbitrary integer value.
+-	OPTIONS
+-	           	all
+-	    Cleans and compiles the entire project.
+-	           	centralCoord
+-	    Compiles the central coordinator algorithm section of the project.
+-	           	philosopher
+-	    Compiles the philosopher programs of the project.
+-	            tokenNode
+-	    Compiles the token ring algorithm section of the project.
+-	            starter
+-	    Compiles the file to start the token ring algorithm.
+-	           	clean
+-	    Removes and cleans all compiled files.
+-	AUTHORS
+-	This manual page contributed by Patrick Beech, Gia Dat Diep, Marissa Kremers, Dalton Wright, and Nitesh Magar at St. Cloud State University.
+Output demonstration:
+Centralized algorithm:
+-	General demonstration of requirements (centralized algorithm behavior, 5 processes, random eating/thinking phases):
+  5 processes  random eating times
+other eat time (duplicate to show random):
+  
+  random think times
+
+
+-	Incoming requests not immediately granted are queued:
+ 
+-	More than one philosopher can eat at a time:
+ 
+ 
+Token-ring algorithm:
+-	General demonstration of requirements (token-ring algorithm, 5 processes, random eating/thinking phases):
+ 
+  random eat times
+  random think times
+
+
+
+
+
+
+
+-	More than one philosopher can eat at a time:
+ 
+ 
+Compile programs
+$ make all
+rm -f startC
+rm -f startTR
+rm -f philosopher
+rm -f tokenRingAlgoirthm
+cc -o startC philosopher.h soc.h centralCoord.c
+cc -o philosopher philosopher.h soc.h philosopher.c
+cc     tokenRingAlgoirthm.c   -o tokenRingAlgoirthm
+cc -o startTR philosopher.h soc.h tokenRingStarter.c
+
+Centralized Algorithm Output:
+// Program Output for the first 20 timestamps
+$ ./startC 123
+Coordinator setup successfully...
+About to run 5 processes...
+
+P[1] connected.
+P[2] connected.
+P[3] connected.
+P[4] connected.
+P[5] connected.
+
+CENTRALIZED ALGORITHM
+TS1. P[1] wants to eat now
+TS1. Coord: P[1] wait to eat
+Queue: 1 0 0 0 0
+Available chopsticks: 1 2 3 4 5
+TS1. Coord: P[1] has permission to eat now
+Queue: 0 0 0 0 0
+TS1. P[1] picks up chopsticks 1 and 5 to eat
+TS1. P[1] will eat for 4 seconds
+TS1. P[2] wants to eat now
+TS1. Coord: P[2] wait to eat
+Queue: 2 0 0 0 0
+TS1. P[3] wants to eat now
+TS1. Coord: P[3] wait to eat
+Queue: 2 3 0 0 0
+Available chopsticks: 0 2 3 4 0
+TS1. Coord: P[3] has permission to eat now
+Queue: 2 0 0 0 0
+TS1. P[3] picks up chopsticks 3 and 2 to eat
+TS1. P[3] will eat for 4 seconds
+TS1. P[4] wants to eat now
+TS1. Coord: P[4] wait to eat
+Queue: 2 4 0 0 0
+TS1. P[5] wants to eat now
+TS1. Coord: P[5] wait to eat
+Queue: 2 4 5 0 0
+TS5. P[1] is done eating and is releasing utensils 1 and 5
+TS5. P[1] will think for 2 seconds
+Available chopsticks: 1 0 0 4 5
+TS5. Coord: P[5] has permission to eat now
+Queue: 2 4 0 0 0
+TS5. P[5] picks up chopsticks 5 and 4 to eat
+TS5. P[5] will eat for 3 seconds
+TS5. P[3] is done eating and is releasing utensils 3 and 2
+TS5. P[3] will think for 3 seconds
+Available chopsticks: 1 2 3 0 0
+TS5. Coord: P[2] has permission to eat now
+Queue: 4 0 0 0 0
+TS5. P[2] picks up chopsticks 2 and 1 to eat
+TS5. P[2] will eat for 3 seconds
+TS7. P[1] wants to eat now
+TS7. Coord: P[1] wait to eat
+Queue: 4 1 0 0 0
+TS8. P[5] is done eating and is releasing utensils 5 and 4
+TS8. P[5] will think for 3 seconds
+Available chopsticks: 0 0 3 4 5
+TS8. Coord: P[4] has permission to eat now
+Queue: 1 0 0 0 0
+TS8. P[4] picks up chopsticks 4 and 3 to eat
+TS8. P[4] will eat for 4 seconds
+TS8. P[3] wants to eat now
+TS8. Coord: P[3] wait to eat
+Queue: 1 3 0 0 0
+TS8. P[2] is done eating and is releasing utensils 2 and 1
+TS8. P[2] will think for 3 seconds
+Available chopsticks: 1 2 0 0 5
+TS8. Coord: P[1] has permission to eat now
+Queue: 3 0 0 0 0
+TS8. P[1] picks up chopsticks 1 and 5 to eat
+TS8. P[1] will eat for 2 seconds
+TS10. P[1] is done eating and is releasing utensils 1 and 5
+TS10. P[1] will think for 3 seconds
+TS11. P[5] wants to eat now
+TS11. Coord: P[5] wait to eat
+Queue: 3 5 0 0 0
+TS11. P[2] wants to eat now
+TS11. Coord: P[2] wait to eat
+Queue: 3 5 2 0 0
+Available chopsticks: 1 2 0 0 5
+TS11. Coord: P[2] has permission to eat now
+Queue: 3 5 0 0 0
+TS11. P[2] picks up chopsticks 2 and 1 to eat
+TS11. P[2] will eat for 3 seconds
+TS12. P[4] is done eating and is releasing utensils 4 and 3
+TS12. P[4] will think for 2 seconds
+Available chopsticks: 0 0 3 4 5
+TS12. Coord: P[5] has permission to eat now
+Queue: 3 0 0 0 0
+TS12. P[5] picks up chopsticks 5 and 4 to eat
+TS12. P[5] will eat for 2 seconds
+TS13. P[1] wants to eat now
+TS13. Coord: P[1] wait to eat
+Queue: 3 1 0 0 0
+TS14. P[4] wants to eat now
+TS14. Coord: P[4] wait to eat
+Queue: 3 1 4 0 0
+TS14. P[5] is done eating and is releasing utensils 5 and 4
+TS14. P[5] will think for 2 seconds
+Available chopsticks: 0 0 3 4 5
+TS14. Coord: P[4] has permission to eat now
+Queue: 3 1 0 0 0
+TS14. P[4] picks up chopsticks 4 and 3 to eat
+TS14. P[4] will eat for 3 seconds
+TS14. P[2] is done eating and is releasing utensils 2 and 1
+TS14. P[2] will think for 2 seconds
+Available chopsticks: 1 2 0 0 5
+TS14. Coord: P[1] has permission to eat now
+Queue: 3 0 0 0 0
+TS14. P[1] picks up chopsticks 1 and 5 to eat
+TS14. P[1] will eat for 3 seconds
+TS16. P[5] wants to eat now
+TS16. Coord: P[5] wait to eat
+Queue: 3 5 0 0 0
+TS16. P[2] wants to eat now
+TS16. Coord: P[2] wait to eat
+Queue: 3 5 2 0 0
+TS17. P[4] is done eating and is releasing utensils 4 and 3
+TS17. P[4] will think for 4 seconds
+Available chopsticks: 0 2 3 4 0
+TS17. Coord: P[3] has permission to eat now
+Queue: 5 2 0 0 0
+TS17. P[3] picks up chopsticks 3 and 2 to eat
+TS17. P[3] will eat for 4 seconds
+TS17. P[1] is done eating and is releasing utensils 1 and 5
+TS17. P[1] will think for 3 seconds
+Available chopsticks: 1 0 0 4 5
+TS17. Coord: P[5] has permission to eat now
+Queue: 2 0 0 0 0
+TS17. P[5] picks up chopsticks 5 and 4 to eat
+TS17. P[5] will eat for 2 seconds
+TS19. P[5] is done eating and is releasing utensils 5 and 4
+TS19. P[5] will think for 4 seconds
+TS20. P[1] wants to eat now
+TS20. Coord: P[1] wait to eat
+Queue: 2 1 0 0 0
+Available chopsticks: 1 0 0 4 5
+TS20. Coord: P[1] has permission to eat now
+Queue: 2 0 0 0 0
+TS20. P[1] picks up chopsticks 1 and 5 to eat
+TS20. P[1] will eat for 4 seconds
+^C
+
+
+// Gantt Chart for program output above
+
+  
+
+Token Ring Algorithm Output:
+// Program Output:
+$ ./startTR 159
+
+About to run 5 processes...
+ID[3]: Port 31362 is ready
+ID[1]: Port 31360 is ready
+ID[2]: Port 31361 is ready
+ID[4]: Port 31363 is ready
+ID[5]: Port 31364 is ready
+ID[3]: Connects port 31363
+ID[1]: Connects port 31361
+ID[2]: Connects port 31362
+ID[4]: Connects port 31364
+ID[5]: Connects port 31360
+P[1]: Available chopsticks: 1 2 3 4 5
+
+TOKEN RING ALGORITHM
+TS2. P[1]: Has the token and is ready to eat.
+P[1]: Picking up utensils 1 and 5 to eat
+P[1]: Available chopsticks: 0 2 3 4 0
+TS2. P[1] will eat for 3 seconds.
+TS2. P[3]: Has the token and is ready to eat.
+P[3]: Picking up utensils 3 and 2 to eat
+P[3]: Available chopsticks: 0 0 0 4 0
+TS2. P[3] will eat for 4 seconds.
+TS5. P[1] has finished eating.
+P[1]: Releasing chopsticks 1 and 5
+P[1]: Available chopsticks: 1 0 0 4 5
+TS5. P[1] will think for 3 seconds.
+TS5. P[5]: Has the token and is ready to eat.
+P[5]: Picking up utensils 5 and 4 to eat
+P[5]: Available chopsticks: 1 0 0 0 0
+TS5. P[5] will eat for 4 seconds.
+TS6. P[3] has finished eating.
+P[3]: Releasing chopsticks 3 and 2
+P[3]: Available chopsticks: 1 2 3 0 0
+TS6. P[3] will think for 2 seconds.
+TS6. P[2]: Has the token and is ready to eat.
+P[2]: Picking up utensils 2 and 1 to eat
+P[2]: Available chopsticks: 0 0 3 0 0
+TS6. P[2] will eat for 2 seconds.
+TS8. P[1] has finished thinking.
+TS8. P[3] has finished thinking.
+TS8. P[2] has finished eating.
+P[2]: Releasing chopsticks 2 and 1
+P[2]: Available chopsticks: 1 2 3 0 0
+TS8. P[3]: Has the token and is ready to eat.
+P[3]: Picking up utensils 3 and 2 to eat
+P[3]: Available chopsticks: 1 0 0 0 0
+TS8. P[2] will think for 4 seconds.
+TS8. P[3] will eat for 2 seconds.
+TS9. P[5] has finished eating.
+P[5]: Releasing chopsticks 5 and 4
+P[5]: Available chopsticks: 1 0 0 4 5
+TS9. P[5] will think for 2 seconds.
+TS9. P[1]: Has the token and is ready to eat.
+P[1]: Picking up utensils 1 and 5 to eat
+P[1]: Available chopsticks: 0 0 0 4 0
+TS9. P[1] will eat for 4 seconds.
+TS10. P[3] has finished eating.
+P[3]: Releasing chopsticks 3 and 2
+P[3]: Available chopsticks: 0 2 3 4 0
+TS10. P[4]: Has the token and is ready to eat.
+P[4]: Picking up utensils 4 and 3 to eat
+P[4]: Available chopsticks: 0 2 0 0 0
+TS10. P[3] will think for 2 seconds.
+TS10. P[4] will eat for 2 seconds.
+TS11. P[5] has finished thinking.
+TS12. P[2] has finished thinking.
+TS12. P[3] has finished thinking.
+TS12. P[4] has finished eating.
+P[4]: Releasing chopsticks 4 and 3
+P[4]: Available chopsticks: 0 2 3 4 0
+TS12. P[4] will think for 3 seconds.
+TS12. P[3]: Has the token and is ready to eat.
+P[3]: Picking up utensils 3 and 2 to eat
+P[3]: Available chopsticks: 0 0 0 4 0
+TS12. P[3] will eat for 2 seconds.
+TS13. P[1] has finished eating.
+P[1]: Releasing chopsticks 1 and 5
+P[1]: Available chopsticks: 1 0 0 4 5
+TS13. P[1] will think for 2 seconds.
+TS13. P[5]: Has the token and is ready to eat.
+P[5]: Picking up utensils 5 and 4 to eat
+P[5]: Available chopsticks: 1 0 0 0 0
+TS13. P[5] will eat for 3 seconds.
+TS14. P[3] has finished eating.
+P[3]: Releasing chopsticks 3 and 2
+P[3]: Available chopsticks: 1 2 3 0 0
+TS14. P[3] will think for 3 seconds.
+TS14. P[2]: Has the token and is ready to eat.
+P[2]: Picking up utensils 2 and 1 to eat
+P[2]: Available chopsticks: 0 0 3 0 0
+TS14. P[2] will eat for 3 seconds.
+TS15. P[1] has finished thinking.
+TS15. P[4] has finished thinking.
+TS16. P[5] has finished eating.
+P[5]: Releasing chopsticks 5 and 4
+P[5]: Available chopsticks: 0 0 3 4 5
+TS16. P[5] will think for 2 seconds.
+TS16. P[4]: Has the token and is ready to eat.
+P[4]: Picking up utensils 4 and 3 to eat
+P[4]: Available chopsticks: 0 0 0 0 5
+TS16. P[4] will eat for 3 seconds.
+TS17. P[3] has finished thinking.
+TS17. P[2] has finished eating.
+P[2]: Releasing chopsticks 2 and 1
+P[2]: Available chopsticks: 1 2 0 0 5
+TS17. P[2] will think for 3 seconds.
+TS17. P[1]: Has the token and is ready to eat.
+P[1]: Picking up utensils 1 and 5 to eat
+P[1]: Available chopsticks: 0 2 0 0 0
+TS17. P[1] will eat for 3 seconds.
+TS18. P[5] has finished thinking.
+TS19. P[4] has finished eating.
+P[4]: Releasing chopsticks 4 and 3
+P[4]: Available chopsticks: 0 2 3 4 0
+TS19. P[3]: Has the token and is ready to eat.
+P[3]: Picking up utensils 3 and 2 to eat
+P[3]: Available chopsticks: 0 0 0 4 0
+TS19. P[3] will eat for 4 seconds.
+TS19. P[4] will think for 3 seconds.
+TS20. P[2] has finished thinking.
+TS20. P[1] has finished eating.
+P[1]: Releasing chopsticks 1 and 5
+P[1]: Available chopsticks: 1 0 0 4 5
+TS20. P[1] will think for 2 seconds.
+TS20. P[5]: Has the token and is ready to eat.
+P[5]: Picking up utensils 5 and 4 to eat
+P[5]: Available chopsticks: 1 0 0 0 0
+TS20. P[5] will eat for 3 seconds.
+^C
+
